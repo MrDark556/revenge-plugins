@@ -52,6 +52,7 @@
     wrap: { flexDirection: "row", flexWrap: "wrap" },
     text: { color: col("TEXT_NORMAL", "#dbdee1"), fontSize: 14 },
     muted: { color: col("TEXT_MUTED", "#949ba4"), fontSize: 12, marginTop: 2 },
+    place: { color: col("TEXT_NORMAL", "#dbdee1"), fontSize: 13, fontWeight: "600", marginTop: 3 },
     author: { color: col("TEXT_NORMAL", "#dbdee1"), fontSize: 15, fontWeight: "bold", marginRight: 6 },
     badge: { borderRadius: 4, paddingHorizontal: 6, paddingVertical: 2, marginRight: 4 },
     badgeText: { color: "#ffffff", fontSize: 10, fontWeight: "bold" },
@@ -93,17 +94,35 @@
   const newUid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
   const clone = () => JSON.parse(JSON.stringify(storage.log ?? []));
 
+  const isGuildEntry = (e) => e.kind === "guild" || (!e.kind && !!e.guildId);
+
+  // nombre del servidor: el guardado, o uno nuevo buscado en Discord si faltaba
+  const guildNameOf = (e) => {
+    if (e.guildName && e.guildName !== "Servidor") return e.guildName;
+    try {
+      const g = GuildStore?.getGuild(e.guildId);
+      if (g?.name) return g.name;
+    } catch (err) {}
+    return e.guildName ?? "Servidor desconocido";
+  };
+
   const placeOf = (e) =>
-    e.kind === "guild"
-      ? `#${e.channel} · ${e.guildName}`
+    isGuildEntry(e)
+      ? `#${e.channel} · ${guildNameOf(e)}`
       : e.kind === "group"
       ? `Grupo · ${e.channel}`
-      : e.kind === "dm"
-      ? `Mensaje Directo · ${e.channel}`
-      : (e.guildId ? "#" : "") + (e.channel ?? "MD");
+      : `Mensaje Directo · ${e.channel ?? "desconocido"}`;
+
+  // versión con emoji para mostrar en pantalla
+  const placeLabel = (e) =>
+    isGuildEntry(e)
+      ? `🏠 ${guildNameOf(e)}  ·  #${e.channel}`
+      : e.kind === "group"
+      ? `👥 Grupo · ${e.channel}`
+      : `💬 Mensaje directo · ${e.channel ?? "desconocido"}`;
 
   const scopeOf = (e) =>
-    e.kind === "guild" ? e.guildName : e.kind === "group" ? "Grupos" : e.kind === "dm" ? "Mensajes directos" : e.guildId ? "Servidor" : "Mensajes directos";
+    isGuildEntry(e) ? guildNameOf(e) : e.kind === "group" ? "Grupos" : "Mensajes directos";
 
   const labelOf = (e) => (e.purged ? "PURGADO" : e.type === "edit" ? "EDITADO" : "BORRADO");
 
@@ -111,7 +130,10 @@
     const ch = ChannelStore.getChannel(channelId);
     const gid = guildId ?? ch?.guild_id ?? null;
     if (gid) {
-      const g = GuildStore?.getGuild(gid);
+      let g = GuildStore?.getGuild(gid);
+      if (!g?.name) {
+        try { g = GuildStore?.getGuilds?.()?.[gid]; } catch (err) {}
+      }
       return { kind: "guild", guildId: gid, guildName: g?.name ?? "Servidor", channel: ch?.name ?? "canal" };
     }
     const names = (ch?.recipients ?? [])
@@ -298,7 +320,8 @@
         e.ghost ? h(View, { style: [S.badge, { backgroundColor: BRAND }] }, h(Text, { style: S.badgeText }, "GHOST PING")) : null,
         e.pinned ? h(Text, { style: S.text }, "📌") : null
       ),
-      h(Text, { style: S.muted }, `${placeOf(e)} · ${new Date(e.time).toLocaleString()}`),
+      h(Text, { style: S.place }, placeLabel(e)),
+      h(Text, { style: S.muted }, new Date(e.time).toLocaleString()),
       isEdit
         ? [
             h(
