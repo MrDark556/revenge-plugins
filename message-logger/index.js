@@ -16,7 +16,7 @@
   const MAX_ENTRIES = 1500; // los fijados no cuentan para el recorte
   const MAX_CACHE = 3000; // mensajes recordados en memoria
   const PAGE = 30; // entradas por página en la pantalla
-  const TAG_DEL = "🗑️ **Mensaje eliminado**";
+  const DEL_MARK = "🗑️ Mensaje eliminado";
   const TAG_EDIT = "✏️ **Antes:**";
   const DEFAULTS = { keepDeleted: true, showEdits: true, ignoreSelf: true };
   const RANGES = [["Todo", 0], ["24 h", 864e5], ["7 días", 6048e5], ["30 días", 2592e6]];
@@ -76,14 +76,26 @@
 
   // ---------- utilidades ----------
 
+  // Un mensaje eliminado se muestra dentro de un bloque "diff": las líneas con "- " salen en rojo
+  const wrapDeleted = (text) =>
+    "```diff\n" +
+    (text ? text.replace(/```/g, "'''").split("\n").map((l) => "- " + l).join("\n") + "\n" : "") +
+    "- " + DEL_MARK + "\n```";
+
+  const isDeleted = (c) => !!c && c.startsWith("```diff\n") && c.includes("- " + DEL_MARK);
+
+  const unwrapDeleted = (c) => {
+    const lines = c.split("\n");
+    lines.shift();
+    while (lines.length && (lines[lines.length - 1] === "```" || lines[lines.length - 1] === "- " + DEL_MARK)) lines.pop();
+    return lines.map((l) => (l.startsWith("- ") ? l.slice(2) : l)).join("\n");
+  };
+
   const stripTags = (c) => {
     if (!c) return "";
-    let cut = c.length;
-    for (const t of [TAG_DEL, TAG_EDIT]) {
-      const i = c.indexOf(t);
-      if (i !== -1 && i < cut) cut = i;
-    }
-    return c.slice(0, cut).replace(/\s+$/, "");
+    if (isDeleted(c)) return unwrapDeleted(c);
+    const i = c.indexOf(TAG_EDIT);
+    return (i === -1 ? c : c.slice(0, i)).replace(/\s+$/, "");
   };
 
   const withTag = (content, tag) => (content ? content + "\n\n" + tag : tag);
@@ -215,7 +227,7 @@
     if (!cached && !msg) return false;
 
     const storeContent = msg?.content ?? "";
-    if (storeContent.includes(TAG_DEL)) return !!storage.keepDeleted;
+    if (isDeleted(storeContent)) return !!storage.keepDeleted;
 
     const author = cached?.author ?? msg?.author;
     if (storage.ignoreSelf && author?.id && author.id === me()) return false;
@@ -247,7 +259,7 @@
     orig({
       type: "MESSAGE_UPDATE",
       guildId,
-      message: { id, channel_id: channelId, guild_id: guildId, content: withTag(shown, TAG_DEL) },
+      message: { id, channel_id: channelId, guild_id: guildId, content: wrapDeleted(shown) },
     });
     return true;
   }
