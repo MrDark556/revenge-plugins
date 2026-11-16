@@ -2,31 +2,76 @@
   "use strict";
 
   const { findByStoreName, findByProps } = vendetta.metro;
-  const { React, ReactNative, FluxDispatcher } = vendetta.metro.common;
+  const common = vendetta.metro.common;
+  const { React, ReactNative, FluxDispatcher } = common;
   const { instead } = vendetta.patcher;
   const { useProxy } = vendetta.storage;
-  const { Forms } = vendetta.ui.components;
   const { showToast } = vendetta.ui.toasts;
   const { getAssetIDByName } = vendetta.ui.assets;
   const storage = vendetta.plugin.storage;
 
   const h = React.createElement;
-  const { ScrollView } = ReactNative;
-  const { FormSection, FormRow, FormSwitchRow, FormDivider } = Forms;
+  const { View, Text, TextInput, TouchableOpacity, ScrollView, Switch } = ReactNative;
 
-  const MAX_ENTRIES = 500; // máximo de entradas guardadas en el registro
-  const MAX_SHOWN = 100; // máximo de entradas dibujadas en la pantalla de ajustes
+  const MAX_ENTRIES = 1500; // los fijados no cuentan para el recorte
   const MAX_CACHE = 3000; // mensajes recordados en memoria
+  const PAGE = 30; // entradas por página en la pantalla
   const TAG_DEL = "🗑️ **Mensaje eliminado**";
   const TAG_EDIT = "✏️ **Antes:**";
-
   const DEFAULTS = { keepDeleted: true, showEdits: true, ignoreSelf: true };
+  const RANGES = [["Todo", 0], ["24 h", 864e5], ["7 días", 6048e5], ["30 días", 2592e6]];
+  const TABS = [
+    ["delete", "🗑️ Borrados"],
+    ["edit", "✏️ Editados"],
+    ["purge", "🧹 Purgados"],
+    ["ghost", "👻 Ghost pings"],
+    ["pinned", "📌 Fijados"],
+    ["stats", "📊 Estadísticas"],
+  ];
 
-  let MessageStore, ChannelStore, UserStore;
+  let MessageStore, ChannelStore, UserStore, GuildStore;
   let unpatch;
-
-  // caché en memoria: guarda el contenido real de cada mensaje que llega
   const cache = new Map();
+
+  // ---------- estilos ----------
+
+  const SC = vendetta.ui.semanticColors ?? {};
+  const RAW = vendetta.ui.rawColors ?? {};
+  const col = (k, fb) => SC[k] ?? fb;
+  const SS = common.stylesheet ?? ReactNative.StyleSheet;
+  const mk = (SS.createThemedStyleSheet ?? ReactNative.StyleSheet.create).bind(SS);
+  const BRAND = RAW.BRAND_500 ?? "#5865f2";
+  const RED = "#ed4245";
+  const YELLOW = "#faa61a";
+  const GREEN = "#3ba55d";
+
+  const S = mk({
+    root: { padding: 12, paddingBottom: 40 },
+    card: { backgroundColor: col("BACKGROUND_SECONDARY", "#2b2d31"), borderRadius: 10, padding: 10, marginBottom: 10 },
+    row: { flexDirection: "row", alignItems: "center", flexWrap: "wrap" },
+    wrap: { flexDirection: "row", flexWrap: "wrap" },
+    text: { color: col("TEXT_NORMAL", "#dbdee1"), fontSize: 14 },
+    muted: { color: col("TEXT_MUTED", "#949ba4"), fontSize: 12, marginTop: 2 },
+    author: { color: col("TEXT_NORMAL", "#dbdee1"), fontSize: 15, fontWeight: "bold", marginRight: 6 },
+    badge: { borderRadius: 4, paddingHorizontal: 6, paddingVertical: 2, marginRight: 4 },
+    badgeText: { color: "#ffffff", fontSize: 10, fontWeight: "bold" },
+    box: { backgroundColor: col("BACKGROUND_TERTIARY", "#1e1f22"), borderRadius: 6, padding: 8, marginTop: 6, borderLeftWidth: 3 },
+    boxDel: { borderLeftColor: RED },
+    boxNew: { borderLeftColor: GREEN },
+    boxLabel: { color: col("TEXT_MUTED", "#949ba4"), fontSize: 11, fontWeight: "bold", marginBottom: 2 },
+    chip: { backgroundColor: col("BACKGROUND_TERTIARY", "#1e1f22"), borderRadius: 8, paddingHorizontal: 10, paddingVertical: 7, marginRight: 6, marginBottom: 6 },
+    chipOn: { backgroundColor: BRAND },
+    chipText: { color: col("TEXT_NORMAL", "#dbdee1"), fontSize: 13 },
+    chipTextOn: { color: "#ffffff", fontSize: 13, fontWeight: "bold" },
+    input: { color: col("TEXT_NORMAL", "#dbdee1"), backgroundColor: col("BACKGROUND_TERTIARY", "#1e1f22"), borderRadius: 8, paddingHorizontal: 10, paddingVertical: 8, fontSize: 14, marginBottom: 8 },
+    actions: { flexDirection: "row", marginTop: 8 },
+    action: { backgroundColor: col("BACKGROUND_TERTIARY", "#1e1f22"), borderRadius: 6, paddingHorizontal: 8, paddingVertical: 5, marginRight: 6 },
+    actionText: { color: col("TEXT_NORMAL", "#dbdee1"), fontSize: 12 },
+    optRow: { flexDirection: "row", alignItems: "center", paddingVertical: 6 },
+    bigBtn: { borderRadius: 8, paddingVertical: 10, alignItems: "center", marginTop: 8 },
+    bigBtnText: { color: "#ffffff", fontSize: 14, fontWeight: "bold" },
+    title: { color: col("TEXT_NORMAL", "#dbdee1"), fontSize: 16, fontWeight: "bold", marginBottom: 6 },
+  });
 
   // ---------- utilidades ----------
 
@@ -41,22 +86,45 @@
   };
 
   const withTag = (content, tag) => (content ? content + "\n\n" + tag : tag);
-
-  const quote = (text) =>
-    text
-      .split("\n")
-      .map((l) => "> " + l)
-      .join("\n");
-
+  const quote = (text) => text.split("\n").map((l) => "> " + l).join("\n");
   const me = () => UserStore.getCurrentUser()?.id;
+  const nameOf = (a) => a?.globalName ?? a?.global_name ?? a?.username ?? "desconocido";
+  const urlsOf = (list) => Array.from(list ?? []).map((a) => a.url ?? a.proxy_url).filter(Boolean);
+  const newUid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+  const clone = () => JSON.parse(JSON.stringify(storage.log ?? []));
 
-  const nameOf = (a) =>
-    a?.globalName ?? a?.global_name ?? a?.username ?? "desconocido";
+  const placeOf = (e) =>
+    e.kind === "guild"
+      ? `#${e.channel} · ${e.guildName}`
+      : e.kind === "group"
+      ? `Grupo · ${e.channel}`
+      : e.kind === "dm"
+      ? `Mensaje Directo · ${e.channel}`
+      : (e.guildId ? "#" : "") + (e.channel ?? "MD");
 
-  const urlsOf = (list) =>
-    Array.from(list ?? [])
-      .map((a) => a.url ?? a.proxy_url)
+  const scopeOf = (e) =>
+    e.kind === "guild" ? e.guildName : e.kind === "group" ? "Grupos" : e.kind === "dm" ? "Mensajes directos" : e.guildId ? "Servidor" : "Mensajes directos";
+
+  const labelOf = (e) => (e.purged ? "PURGADO" : e.type === "edit" ? "EDITADO" : "BORRADO");
+
+  function describePlace(channelId, guildId) {
+    const ch = ChannelStore.getChannel(channelId);
+    const gid = guildId ?? ch?.guild_id ?? null;
+    if (gid) {
+      const g = GuildStore?.getGuild(gid);
+      return { kind: "guild", guildId: gid, guildName: g?.name ?? "Servidor", channel: ch?.name ?? "canal" };
+    }
+    const names = (ch?.recipients ?? [])
+      .map((id) => {
+        const u = UserStore.getUser(id);
+        return u ? nameOf(u) : null;
+      })
       .filter(Boolean);
+    if (ch?.type === 3) {
+      return { kind: "group", guildId: null, guildName: null, channel: ch?.name || names.join(", ") || "Grupo" };
+    }
+    return { kind: "dm", guildId: null, guildName: null, channel: names[0] ?? ch?.name ?? "desconocido" };
+  }
 
   function remember(raw, channelIdFallback) {
     try {
@@ -65,39 +133,39 @@
       if (!channelId) return;
       const key = channelId + ":" + raw.id;
       const prev = cache.get(key);
+      const hasMentions = raw.mentions !== undefined || raw.mention_everyone !== undefined;
       const entry = {
         content: raw.content !== undefined ? stripTags(raw.content) : prev?.content,
         attachments: raw.attachments ? urlsOf(raw.attachments) : prev?.attachments,
         author: raw.author ?? prev?.author,
+        pingsMe: hasMentions
+          ? !!(raw.mention_everyone || (raw.mentions ?? []).some((u) => u.id === me()))
+          : prev?.pingsMe,
       };
       cache.delete(key);
       cache.set(key, entry);
-      if (cache.size > MAX_CACHE) {
-        cache.delete(cache.keys().next().value);
-      }
+      if (cache.size > MAX_CACHE) cache.delete(cache.keys().next().value);
     } catch (e) {}
   }
 
   function addLog(entry) {
-    storage.log = [entry, ...(storage.log ?? [])].slice(0, MAX_ENTRIES);
+    const l = [{ uid: newUid(), pinned: false, ...entry }, ...clone()];
+    let extra = l.length - MAX_ENTRIES;
+    for (let i = l.length - 1; i >= 0 && extra > 0; i--) {
+      if (!l[i].pinned) {
+        l.splice(i, 1);
+        extra--;
+      }
+    }
+    storage.log = l;
   }
 
-  function baseInfo(author, messageId, channelId, guildId) {
-    const ch = ChannelStore.getChannel(channelId);
-    return {
-      time: Date.now(),
-      messageId,
-      channelId,
-      guildId: guildId ?? ch?.guild_id ?? null,
-      channel: ch?.name ?? "MD",
-      author: nameOf(author),
-      authorId: author?.id ?? null,
-    };
-  }
+  const mutate = (fn) => {
+    storage.log = fn(clone());
+  };
 
   function entryToText(e) {
-    const fecha = new Date(e.time).toLocaleString();
-    const cab = `[${fecha}] ${e.type === "delete" ? "ELIMINADO" : "EDITADO"} · ${e.author} · ${e.guildId ? "#" : ""}${e.channel}`;
+    const cab = `[${new Date(e.time).toLocaleString()}] ${labelOf(e)}${e.ghost ? " (ghost ping)" : ""} · ${e.author} · ${placeOf(e)}`;
     if (e.type === "delete") {
       let t = cab + "\n" + (e.content || "(sin texto)");
       if (e.attachments?.length) t += "\nAdjuntos:\n" + e.attachments.join("\n");
@@ -108,9 +176,7 @@
 
   function copy(text) {
     try {
-      const cb =
-        vendetta.metro.common.clipboard ??
-        findByProps("setString", "getString");
+      const cb = common.clipboard ?? findByProps("setString", "getString");
       cb.setString(text);
       showToast("Copiado", getAssetIDByName("check"));
     } catch (e) {
@@ -120,53 +186,50 @@
 
   // ---------- lógica principal ----------
 
-  // Devuelve true si el evento de borrado debe tragarse (el mensaje se queda en el chat)
-  function processDelete(orig, channelId, id, guildId) {
+  function processDelete(orig, channelId, id, guildId, purged) {
     const key = channelId + ":" + id;
     const cached = cache.get(key);
     const msg = MessageStore.getMessage(channelId, id);
     if (!cached && !msg) return false;
 
     const storeContent = msg?.content ?? "";
-    if (storeContent.includes(TAG_DEL)) return !!storage.keepDeleted; // ya estaba marcado
+    if (storeContent.includes(TAG_DEL)) return !!storage.keepDeleted;
 
     const author = cached?.author ?? msg?.author;
     if (storage.ignoreSelf && author?.id && author.id === me()) return false;
 
-    // preferimos el texto de la caché; si no hay, el de la tienda de Discord
     const clean = cached?.content || stripTags(storeContent);
-    const attachments = cached?.attachments?.length
-      ? cached.attachments
-      : urlsOf(msg?.attachments);
+    const attachments = cached?.attachments?.length ? cached.attachments : urlsOf(msg?.attachments);
 
     storage.lastDelete = `fuente=${cached?.content ? "caché" : msg ? "tienda" : "ninguna"}, largo=${clean.length}, adjuntos=${attachments.length}`;
 
     if (!clean && !attachments.length) return false;
 
     addLog({
-      ...baseInfo(author, id, channelId, guildId),
+      time: Date.now(),
       type: "delete",
+      purged: !!purged,
+      ghost: !!(cached?.pingsMe ?? msg?.mentioned),
+      messageId: id,
+      channelId,
+      ...describePlace(channelId, guildId),
+      author: nameOf(author),
+      authorId: author?.id ?? null,
       content: clean,
       attachments,
     });
 
     if (!storage.keepDeleted) return false;
 
-    const shown = clean || (attachments.length ? attachments.join("\n") : "");
+    const shown = clean || attachments.join("\n");
     orig({
       type: "MESSAGE_UPDATE",
       guildId,
-      message: {
-        id,
-        channel_id: channelId,
-        guild_id: guildId,
-        content: withTag(shown, TAG_DEL),
-      },
+      message: { id, channel_id: channelId, guild_id: guildId, content: withTag(shown, TAG_DEL) },
     });
     return true;
   }
 
-  // Devuelve un evento modificado o null si no hay que tocar nada
   function processEdit(event) {
     const m = event.message;
     if (!m || m.content === undefined || !m.channel_id || !m.id) return null;
@@ -177,13 +240,11 @@
     const oldClean = cached?.content ?? stripTags(old?.content);
     const newContent = m.content ?? "";
 
-    // actualizamos la caché con el texto real que llegó del servidor
     remember(m);
 
     if (!old && cached?.content === undefined) return null;
 
     if (oldClean === newContent) {
-      // actualización sin cambio de texto (embeds, etc.): conservar las marcas
       if (old && old.content !== stripTags(old.content)) {
         return { ...event, message: { ...m, content: old.content } };
       }
@@ -194,8 +255,13 @@
     if (storage.ignoreSelf && author?.id && author.id === me()) return null;
 
     addLog({
-      ...baseInfo(author, m.id, m.channel_id, event.guildId ?? m.guild_id),
+      time: Date.now(),
       type: "edit",
+      messageId: m.id,
+      channelId: m.channel_id,
+      ...describePlace(m.channel_id, event.guildId ?? m.guild_id),
+      author: nameOf(author),
+      authorId: author?.id ?? null,
       before: oldClean,
       after: newContent,
     });
@@ -203,105 +269,250 @@
     if (storage.showEdits && oldClean) {
       return {
         ...event,
-        message: {
-          ...m,
-          content: withTag(newContent, TAG_EDIT + "\n" + quote(oldClean)),
-        },
+        message: { ...m, content: withTag(newContent, TAG_EDIT + "\n" + quote(oldClean)) },
       };
     }
     return null;
   }
 
-  // ---------- pantalla de ajustes ----------
+  // ---------- interfaz ----------
+
+  function Btn({ label, onPress, onLongPress, on, style, textStyle }) {
+    return h(
+      TouchableOpacity,
+      { onPress, onLongPress, style: style ?? [S.chip, on ? S.chipOn : null] },
+      h(Text, { style: textStyle ?? (on ? S.chipTextOn : S.chipText) }, label)
+    );
+  }
+
+  function Entry({ e }) {
+    const isEdit = e.type === "edit";
+    return h(
+      View,
+      { style: S.card },
+      h(
+        View,
+        { style: S.row },
+        h(Text, { style: S.author }, e.author),
+        h(View, { style: [S.badge, { backgroundColor: isEdit ? YELLOW : RED }] }, h(Text, { style: S.badgeText }, labelOf(e))),
+        e.ghost ? h(View, { style: [S.badge, { backgroundColor: BRAND }] }, h(Text, { style: S.badgeText }, "GHOST PING")) : null,
+        e.pinned ? h(Text, { style: S.text }, "📌") : null
+      ),
+      h(Text, { style: S.muted }, `${placeOf(e)} · ${new Date(e.time).toLocaleString()}`),
+      isEdit
+        ? [
+            h(
+              View,
+              { key: "a", style: [S.box, S.boxDel] },
+              h(Text, { style: S.boxLabel }, "ANTES"),
+              h(Text, { style: S.text, selectable: true }, e.before || "(vacío)")
+            ),
+            h(
+              View,
+              { key: "d", style: [S.box, S.boxNew] },
+              h(Text, { style: S.boxLabel }, "DESPUÉS"),
+              h(Text, { style: S.text, selectable: true }, e.after || "(vacío)")
+            ),
+          ]
+        : h(
+            View,
+            { style: [S.box, S.boxDel] },
+            h(Text, { style: S.text, selectable: true }, e.content || (e.attachments?.length ? "[solo adjuntos]" : "(sin texto)")),
+            e.attachments?.length ? h(Text, { style: S.muted, selectable: true }, e.attachments.join("\n")) : null
+          ),
+      h(
+        View,
+        { style: S.actions },
+        h(Btn, { label: "📋 Copiar", style: S.action, textStyle: S.actionText, onPress: () => copy(entryToText(e)) }),
+        h(Btn, {
+          label: e.pinned ? "📍 Desfijar" : "📌 Fijar",
+          style: S.action,
+          textStyle: S.actionText,
+          onPress: () => mutate((l) => l.map((x) => (x.uid === e.uid ? { ...x, pinned: !x.pinned } : x))),
+        }),
+        h(Btn, {
+          label: "✖ Quitar",
+          style: S.action,
+          textStyle: S.actionText,
+          onPress: () => mutate((l) => l.filter((x) => x.uid !== e.uid)),
+        })
+      )
+    );
+  }
+
+  function Stats({ log }) {
+    const now = Date.now();
+    const count = (fn) => log.filter(fn).length;
+    const top = (fn) => {
+      const m = {};
+      log.forEach((e) => {
+        const k = fn(e);
+        m[k] = (m[k] || 0) + 1;
+      });
+      return Object.entries(m).sort((a, b) => b[1] - a[1]).slice(0, 5);
+    };
+    const line = (t, i) => h(Text, { key: t + i, style: S.text }, t);
+    return h(
+      View,
+      null,
+      h(
+        View,
+        { style: S.card },
+        h(Text, { style: S.title }, "Resumen"),
+        line(`Total de entradas: ${log.length}`, 0),
+        line(`Borrados: ${count((e) => e.type === "delete" && !e.purged)}`, 1),
+        line(`Editados: ${count((e) => e.type === "edit")}`, 2),
+        line(`Purgados: ${count((e) => e.purged)}`, 3),
+        line(`Ghost pings: ${count((e) => e.ghost)}`, 4),
+        line(`Fijados: ${count((e) => e.pinned)}`, 5),
+        line(`Últimas 24 h: ${count((e) => now - e.time < 864e5)}`, 6)
+      ),
+      h(
+        View,
+        { style: S.card },
+        h(Text, { style: S.title }, "Autores con más entradas"),
+        ...(top((e) => e.author).map(([k, v], i) => line(`${i + 1}. ${k} — ${v}`, i)) || [])
+      ),
+      h(
+        View,
+        { style: S.card },
+        h(Text, { style: S.title }, "Lugares con más entradas"),
+        ...(top((e) => placeOf(e)).map(([k, v], i) => line(`${i + 1}. ${k} — ${v}`, i)) || [])
+      )
+    );
+  }
 
   function Settings() {
     useProxy(storage);
-    const log = storage.log ?? [];
+    const [tab, setTab] = React.useState("delete");
+    const [query, setQuery] = React.useState("");
+    const [scopeIdx, setScopeIdx] = React.useState(0);
+    const [rangeIdx, setRangeIdx] = React.useState(0);
+    const [asc, setAsc] = React.useState(false);
+    const [limit, setLimit] = React.useState(PAGE);
+    const [showOpts, setShowOpts] = React.useState(false);
 
-    const rows = log.slice(0, MAX_SHOWN).map((e, i) => {
-      const icon = e.type === "delete" ? "🗑️" : "✏️";
-      const where = (e.guildId ? "#" : "") + e.channel;
-      const body =
-        e.type === "delete"
-          ? e.content || (e.attachments?.length ? `[${e.attachments.length} adjunto(s)]` : "")
-          : `Antes: ${e.before || "(vacío)"}\nDespués: ${e.after || "(vacío)"}`;
-      return h(
-        React.Fragment,
-        { key: `${e.time}-${i}` },
-        h(FormRow, {
-          label: `${icon} ${e.author} · ${where}`,
-          subLabel: `${body}\n${new Date(e.time).toLocaleString()}`,
-          onPress: () => copy(entryToText(e)),
-        }),
-        h(FormDivider)
+    const log = Array.from(storage.log ?? []);
+
+    const inTab = (e, t) =>
+      t === "delete" ? e.type === "delete" && !e.purged
+      : t === "edit" ? e.type === "edit"
+      : t === "purge" ? !!e.purged
+      : t === "ghost" ? !!e.ghost
+      : t === "pinned" ? !!e.pinned
+      : true;
+
+    const scopes = ["Todos los servidores", ...Array.from(new Set(log.map(scopeOf))).sort()];
+    const scope = scopes[scopeIdx % scopes.length];
+    const [rangeName, rangeMs] = RANGES[rangeIdx % RANGES.length];
+    const q = query.trim().toLowerCase();
+    const now = Date.now();
+
+    const rows = log
+      .filter(
+        (e) =>
+          inTab(e, tab) &&
+          (scopeIdx % scopes.length === 0 || scopeOf(e) === scope) &&
+          (!rangeMs || now - e.time <= rangeMs) &&
+          (!q || `${e.author} ${placeOf(e)} ${e.content ?? ""} ${e.before ?? ""} ${e.after ?? ""}`.toLowerCase().includes(q))
+      )
+      .sort((a, b) => (asc ? a.time - b.time : b.time - a.time));
+
+    const reset = () => setLimit(PAGE);
+
+    const opt = (label, key) =>
+      h(
+        View,
+        { key, style: S.optRow },
+        h(Text, { style: [S.text, { flex: 1, marginRight: 8 }] }, label),
+        h(Switch, { value: !!storage[key], onValueChange: (v) => (storage[key] = v) })
       );
-    });
 
     return h(
       ScrollView,
-      null,
+      { contentContainerStyle: S.root, keyboardShouldPersistTaps: "handled" },
       h(
-        FormSection,
-        { title: "Opciones" },
-        h(FormSwitchRow, {
-          label: "Mantener mensajes eliminados en el chat",
-          subLabel: "Los muestra con la marca 🗑️ en vez de borrarlos",
-          value: !!storage.keepDeleted,
-          onValueChange: (v) => (storage.keepDeleted = v),
-        }),
-        h(FormDivider),
-        h(FormSwitchRow, {
-          label: "Mostrar el texto anterior de los editados",
-          subLabel: "Agrega el contenido original debajo del mensaje",
-          value: !!storage.showEdits,
-          onValueChange: (v) => (storage.showEdits = v),
-        }),
-        h(FormDivider),
-        h(FormSwitchRow, {
-          label: "Ignorar mis propios mensajes",
-          value: !!storage.ignoreSelf,
-          onValueChange: (v) => (storage.ignoreSelf = v),
-        })
-      ),
-      h(
-        FormSection,
-        { title: `Registro (${log.length}/${MAX_ENTRIES})` },
-        h(FormRow, {
-          label: "Copiar todo el registro",
-          subLabel: "Lo copia como texto al portapapeles",
-          onPress: () => {
-            if (!log.length) return showToast("El registro está vacío");
-            copy(log.map(entryToText).join("\n\n"));
+        View,
+        { style: S.card },
+        h(Text, { style: S.title }, "🗑️ Registro de mensajes"),
+        h(TextInput, {
+          style: S.input,
+          value: query,
+          placeholder: "Buscar por autor, canal o contenido...",
+          placeholderTextColor: "#80848e",
+          onChangeText: (t) => {
+            setQuery(t);
+            reset();
           },
         }),
-        h(FormDivider),
-        h(FormRow, {
-          label: "Borrar registro",
+        h(
+          View,
+          { style: S.wrap },
+          h(Btn, { label: "🏠 " + scope, onPress: () => { setScopeIdx((scopeIdx + 1) % scopes.length); reset(); }, onLongPress: () => { setScopeIdx(0); reset(); } }),
+          h(Btn, { label: "📅 " + rangeName, onPress: () => { setRangeIdx((rangeIdx + 1) % RANGES.length); reset(); } }),
+          h(Btn, { label: asc ? "↕ Antiguo → nuevo" : "↕ Nuevo → antiguo", onPress: () => setAsc(!asc) })
+        )
+      ),
+      h(
+        View,
+        { style: S.wrap },
+        ...TABS.map(([id, name]) => {
+          const n = id === "stats" ? "" : ` ${log.filter((e) => inTab(e, id)).length}`;
+          return h(Btn, { key: id, label: name + n, on: tab === id, onPress: () => { setTab(id); reset(); } });
+        })
+      ),
+      tab === "stats"
+        ? h(Stats, { log })
+        : [
+            ...rows.slice(0, limit).map((e, i) => h(Entry, { key: e.uid ?? `${e.time}-${i}`, e })),
+            rows.length === 0 ? h(Text, { key: "vacio", style: [S.muted, { textAlign: "center", marginVertical: 20 }] }, "No hay entradas para mostrar.") : null,
+            rows.length > limit
+              ? h(Btn, { key: "mas", label: `Mostrar más (${rows.length - limit} restantes)`, onPress: () => setLimit(limit + PAGE) })
+              : null,
+          ],
+      h(
+        TouchableOpacity,
+        {
+          style: [S.bigBtn, { backgroundColor: BRAND }],
+          onPress: () => {
+            if (!rows.length) return showToast("No hay nada para exportar");
+            copy(rows.map(entryToText).join("\n\n"));
+          },
+        },
+        h(Text, { style: S.bigBtnText }, `Exportar (${rows.length}) — copia al portapapeles`)
+      ),
+      h(
+        TouchableOpacity,
+        {
+          style: [S.bigBtn, { backgroundColor: RED }],
           onPress: () =>
             vendetta.ui.alerts.showConfirmationAlert({
-              title: "Borrar registro",
-              content: "Se eliminarán todas las entradas guardadas.",
-              confirmText: "Borrar",
+              title: "Limpiar registro",
+              content: "Se eliminarán todas las entradas, excepto las fijadas.",
+              confirmText: "Limpiar",
               cancelText: "Cancelar",
               confirmColor: "red",
               onConfirm: () => {
-                storage.log = [];
-                showToast("Registro borrado", getAssetIDByName("check"));
+                mutate((l) => l.filter((e) => e.pinned));
+                showToast("Registro limpio (se conservaron los fijados)", getAssetIDByName("check"));
               },
             }),
-        })
+        },
+        h(Text, { style: S.bigBtnText }, "Limpiar registro (conserva fijados)")
       ),
       h(
-        FormSection,
-        { title: "Depuración" },
-        h(FormRow, {
-          label: "Último borrado detectado",
-          subLabel: storage.lastDelete || "Todavía ninguno",
-        })
-      ),
-      log.length
-        ? h(FormSection, { title: `Últimas ${Math.min(log.length, MAX_SHOWN)} entradas (toca para copiar)` }, ...rows)
-        : null
+        View,
+        { style: [S.card, { marginTop: 14 }] },
+        h(Btn, { label: showOpts ? "⚙️ Opciones ▾" : "⚙️ Opciones ▸", style: { paddingVertical: 4 }, textStyle: S.title, onPress: () => setShowOpts(!showOpts) }),
+        showOpts
+          ? [
+              opt("Mantener mensajes eliminados en el chat", "keepDeleted"),
+              opt("Mostrar el texto anterior de los editados", "showEdits"),
+              opt("Ignorar mis propios mensajes", "ignoreSelf"),
+              h(Text, { key: "dbg", style: S.muted }, "Último borrado detectado: " + (storage.lastDelete || "ninguno todavía")),
+            ]
+          : null
+      )
     );
   }
 
@@ -313,11 +524,25 @@
         MessageStore = findByStoreName("MessageStore");
         ChannelStore = findByStoreName("ChannelStore");
         UserStore = findByStoreName("UserStore");
+        GuildStore = findByStoreName("GuildStore");
 
         for (const k in DEFAULTS) {
           if (storage[k] === undefined) storage[k] = DEFAULTS[k];
         }
         if (storage.log === undefined) storage.log = [];
+
+        // migración: entradas de versiones anteriores sin id
+        try {
+          const old = clone();
+          let changed = false;
+          old.forEach((e) => {
+            if (!e.uid) {
+              e.uid = newUid();
+              changed = true;
+            }
+          });
+          if (changed) storage.log = old;
+        } catch (e) {}
 
         unpatch = instead("dispatch", FluxDispatcher, (args, orig) => {
           const event = args[0];
@@ -331,13 +556,11 @@
                   for (const raw of event.messages ?? []) remember(raw, event.channelId);
                   break;
                 case "MESSAGE_DELETE":
-                  if (processDelete(orig, event.channelId, event.id, event.guildId)) return;
+                  if (processDelete(orig, event.channelId, event.id, event.guildId, false)) return;
                   break;
                 case "MESSAGE_DELETE_BULK": {
                   const ids = event.ids ?? [];
-                  const rest = ids.filter(
-                    (id) => !processDelete(orig, event.channelId, id, event.guildId)
-                  );
+                  const rest = ids.filter((id) => !processDelete(orig, event.channelId, id, event.guildId, true));
                   if (rest.length !== ids.length) {
                     if (!rest.length) return;
                     return orig({ ...event, ids: rest });
