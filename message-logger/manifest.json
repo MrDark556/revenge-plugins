@@ -1,0 +1,8 @@
+{
+  "name": "Message Logger",
+  "description": "Muestra mensajes eliminados y editados y los guarda en un registro persistente.",
+  "authors": [{ "name": "Dark" }],
+  "main": "index.js",
+  "hash": "cd91034a26d20778646b1b006450ce68cb3f2162ad3b556eea667f19c0f31b09",
+  "vendetta": { "icon": "ic_message_edit" }
+}
