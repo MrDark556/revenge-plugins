@@ -3,7 +3,6 @@
   "description": "Registro de mensajes eliminados y editados con búsqueda, filtros, fijados y estadísticas.",
   "authors": [{ "name": "Dark" }],
   "main": "index.js",
-  "hash": "617eaa7e50a079ee08c4e9f5ec1685d54100a76c4f55b495c25e0107bba8c2d3",
+  "hash": "a6a3a9b0105c702b4b597f48cf794233987c97d0f7bab6c4e47b664597714db3",
   "vendetta": { "icon": "ic_message_edit" }
-}
 
