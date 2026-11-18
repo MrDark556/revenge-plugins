@@ -15,6 +15,7 @@
 
   const MAX_ENTRIES = 1500; // los fijados no cuentan para el recorte
   const MAX_CACHE = 3000; // mensajes recordados en memoria
+  const MAX_KEPT = 300; // mensajes eliminados que se vuelven a mostrar al recargar un chat
   const PAGE = 30; // entradas por página en la pantalla
   const DEL_MARK = "🗑️ Mensaje eliminado";
   const TAG_EDIT = "✏️ **Antes:**";
@@ -172,6 +173,7 @@
         content: raw.content !== undefined ? stripTags(raw.content) : prev?.content,
         attachments: raw.attachments ? urlsOf(raw.attachments) : prev?.attachments,
         author: raw.author ?? prev?.author,
+        raw: { ...(prev?.raw ?? {}), ...raw, channel_id: channelId },
         pingsMe: hasMentions
           ? !!(raw.mention_everyone || (raw.mentions ?? []).some((u) => u.id === me()))
           : prev?.pingsMe,
@@ -185,6 +187,7 @@
   function addLog(entry) {
     const l = [{ uid: newUid(), pinned: false, ...entry }, ...clone()];
     let extra = l.length - MAX_ENTRIES;
+    const trimmed = extra > 0;
     for (let i = l.length - 1; i >= 0 && extra > 0; i--) {
       if (!l[i].pinned) {
         l.splice(i, 1);
@@ -192,11 +195,69 @@
       }
     }
     storage.log = l;
+    if (trimmed) pruneKept(l);
   }
 
   const mutate = (fn) => {
-    storage.log = fn(clone());
+    const next = fn(clone());
+    storage.log = next;
+    pruneKept(next);
   };
+
+  // ids de Discord: comparar como texto numérico sin usar BigInt
+  const cmpId = (a, b) => (a.length !== b.length ? a.length - b.length : a < b ? -1 : a > b ? 1 : 0);
+
+  const loadKept = () => JSON.parse(JSON.stringify(storage.kept ?? {}));
+
+  // guarda una copia del mensaje eliminado para volver a mostrarlo cuando se recargue el chat
+  function keepRaw(channelId, raw) {
+    try {
+      const kept = loadKept();
+      kept[channelId] = (kept[channelId] ?? []).filter((r) => r.id !== raw.id).concat([raw]);
+      const all = [];
+      for (const ch in kept) for (const r of kept[ch]) all.push(r);
+      if (all.length > MAX_KEPT) {
+        all.sort((a, b) => (a.__keptAt ?? 0) - (b.__keptAt ?? 0));
+        const drop = new Set(all.slice(0, all.length - MAX_KEPT).map((r) => r.id));
+        for (const ch in kept) kept[ch] = kept[ch].filter((r) => !drop.has(r.id));
+      }
+      storage.kept = kept;
+    } catch (e) {}
+  }
+
+  // descarta las copias cuya entrada ya no está en el registro
+  function pruneKept(log) {
+    try {
+      const ids = new Set(log.filter((e) => e.type === "delete").map((e) => e.messageId));
+      const kept = loadKept();
+      for (const ch in kept) {
+        kept[ch] = kept[ch].filter((r) => ids.has(r.id));
+        if (!kept[ch].length) delete kept[ch];
+      }
+      storage.kept = kept;
+    } catch (e) {}
+  }
+
+  // al cargar un chat, vuelve a meter los mensajes eliminados que el servidor ya no devuelve
+  function injectKept(event) {
+    if (!storage.keepDeleted) return event;
+    const list = storage.kept?.[event.channelId];
+    if (!list?.length || !event.messages?.length) return event;
+    const msgs = Array.from(event.messages);
+    const have = new Set(msgs.map((m) => m.id));
+    const ids = msgs.map((m) => m.id).sort(cmpId);
+    const minId = ids[0];
+    const maxId = ids[ids.length - 1];
+    const latest = !event.hasMoreAfter;
+    const add = Array.from(list)
+      .filter((r) => !have.has(r.id) && cmpId(r.id, minId) >= 0 && (latest || cmpId(r.id, maxId) <= 0))
+      .map((r) => {
+        const { __keptAt, ...rest } = r;
+        return JSON.parse(JSON.stringify(rest));
+      });
+    if (!add.length) return event;
+    return { ...event, messages: msgs.concat(add).sort((a, b) => cmpId(b.id, a.id)) };
+  }
 
   function entryToText(e) {
     const cab = `[${new Date(e.time).toLocaleString()}] ${labelOf(e)}${e.ghost ? " (ghost ping)" : ""} · ${e.author} · ${placeOf(e)}`;
@@ -235,7 +296,7 @@
     const clean = cached?.content || stripTags(storeContent);
     const attachments = cached?.attachments?.length ? cached.attachments : urlsOf(msg?.attachments);
 
-    storage.lastDelete = `fuente=${cached?.content ? "caché" : msg ? "tienda" : "ninguna"}, largo=${clean.length}, adjuntos=${attachments.length}`;
+    storage.lastDelete = `fuente=${cached?.content ? "caché" : msg ? "tienda" : "ninguna"}, largo=${clean.length}, adjuntos=${attachments.length}, copia=${cached?.raw ? "sí" : "no"}`;
 
     if (!clean && !attachments.length) return false;
 
@@ -256,6 +317,9 @@
     if (!storage.keepDeleted) return false;
 
     const shown = clean || attachments.join("\n");
+    if (cached?.raw) {
+      keepRaw(channelId, { ...cached.raw, content: wrapDeleted(shown), channel_id: channelId, __keptAt: Date.now() });
+    }
     orig({
       type: "MESSAGE_UPDATE",
       guildId,
@@ -565,6 +629,7 @@
           if (storage[k] === undefined) storage[k] = DEFAULTS[k];
         }
         if (storage.log === undefined) storage.log = [];
+        if (storage.kept === undefined) storage.kept = {};
 
         // migración: entradas de versiones anteriores sin id
         try {
@@ -587,9 +652,12 @@
                 case "MESSAGE_CREATE":
                   remember(event.message, event.channelId);
                   break;
-                case "LOAD_MESSAGES_SUCCESS":
+                case "LOAD_MESSAGES_SUCCESS": {
                   for (const raw of event.messages ?? []) remember(raw, event.channelId);
+                  const withKept = injectKept(event);
+                  if (withKept !== event) return orig(withKept);
                   break;
+                }
                 case "MESSAGE_DELETE":
                   if (processDelete(orig, event.channelId, event.id, event.guildId, false)) return;
                   break;
